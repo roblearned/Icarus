@@ -1865,7 +1865,14 @@ namespace stream {
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    // Use multi-display capture if a specific display is requested
+    if (!session->config.display_name.empty()) {
+      BOOST_LOG(info) << "Starting multi-display capture for: " << logging::bracket(session->config.display_name);
+      video::capture_display(session->mail, session->config.monitor, session, session->config.display_name);
+    } else {
+      // Fall back to default capture for backward compatibility
+      video::capture(session->mail, session->config.monitor, session);
+    }
   }
 
   void audioThread(session_t *session) {

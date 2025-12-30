@@ -6,7 +6,9 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
 // lib includes
 #include <boost/pointer_cast.hpp>
@@ -436,6 +438,12 @@ namespace video {
     config_t config;
     int frame_nr;
     void *channel_data;
+
+    /**
+     * @brief The display name this session is bound to.
+     * @details Empty string means use the default display.
+     */
+    std::string display_name;
   };
 
   struct sync_session_t {
@@ -449,6 +457,12 @@ namespace video {
   struct capture_ctx_t {
     img_event_t images;
     config_t config;
+
+    /**
+     * @brief The display name this capture context is bound to.
+     * @details Empty string means use the default display.
+     */
+    std::string display_name;
   };
 
   struct capture_thread_async_ctx_t {
@@ -472,6 +486,133 @@ namespace video {
   // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);
+
+  /**
+   * @brief Per-display capture context for multi-display streaming.
+   * @details Each display has its own capture thread, display object, and list of sessions.
+   */
+  struct per_display_capture_ctx_t {
+    std::string display_name;  ///< The display name (or index) this context is capturing
+    std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue;
+    std::thread capture_thread;
+    safe::signal_t reinit_event;
+    sync_util::sync_t<std::weak_ptr<platf::display_t>> display_wp;
+    const encoder_t *encoder_p;
+    std::atomic<int> session_count {0};  ///< Number of active sessions on this display
+    std::atomic<bool> running {false};  ///< Whether the capture thread is running
+
+    per_display_capture_ctx_t() = default;
+    per_display_capture_ctx_t(const per_display_capture_ctx_t &) = delete;
+    per_display_capture_ctx_t &operator=(const per_display_capture_ctx_t &) = delete;
+  };
+
+  /**
+   * @brief Multi-display capture manager for concurrent display streaming.
+   * @details Manages multiple per-display capture contexts, allowing different
+   *          clients to stream from different displays simultaneously.
+   */
+  class MultiDisplayCaptureManager {
+  public:
+    using display_ctx_ptr = std::shared_ptr<per_display_capture_ctx_t>;
+
+    /**
+     * @brief Get or create a capture context for the specified display.
+     * @param display_name The display name to capture. Empty string uses default display.
+     * @return Shared pointer to the display capture context.
+     */
+    display_ctx_ptr get_or_create_display_ctx(const std::string &display_name) {
+      std::lock_guard<std::mutex> lock(mutex_);
+
+      // Resolve empty display name to default
+      std::string resolved_name = display_name.empty()
+        ? display_device::map_output_name(config::video.output_name)
+        : display_name;
+
+      auto it = display_contexts_.find(resolved_name);
+      if (it != display_contexts_.end() && it->second->running.load()) {
+        return it->second;
+      }
+
+      // Create new display context
+      auto ctx = std::make_shared<per_display_capture_ctx_t>();
+      ctx->display_name = resolved_name;
+      ctx->capture_ctx_queue = std::make_shared<safe::queue_t<capture_ctx_t>>(30);
+      ctx->encoder_p = chosen_encoder;
+      ctx->running.store(true);
+
+      display_contexts_[resolved_name] = ctx;
+
+      BOOST_LOG(info) << "Created capture context for display: " << logging::bracket(resolved_name);
+
+      return ctx;
+    }
+
+    /**
+     * @brief Remove a display capture context when no more sessions are using it.
+     * @param display_name The display name to remove.
+     */
+    void remove_display_ctx(const std::string &display_name) {
+      std::lock_guard<std::mutex> lock(mutex_);
+
+      std::string resolved_name = display_name.empty()
+        ? display_device::map_output_name(config::video.output_name)
+        : display_name;
+
+      auto it = display_contexts_.find(resolved_name);
+      if (it != display_contexts_.end()) {
+        it->second->running.store(false);
+        if (it->second->capture_ctx_queue) {
+          it->second->capture_ctx_queue->stop();
+        }
+        display_contexts_.erase(it);
+        BOOST_LOG(info) << "Removed capture context for display: " << logging::bracket(resolved_name);
+      }
+    }
+
+    /**
+     * @brief Get the number of active display contexts.
+     * @return Number of active display contexts.
+     */
+    size_t active_display_count() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return display_contexts_.size();
+    }
+
+    /**
+     * @brief Shutdown all display capture contexts.
+     */
+    void shutdown_all() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto &[name, ctx] : display_contexts_) {
+        ctx->running.store(false);
+        if (ctx->capture_ctx_queue) {
+          ctx->capture_ctx_queue->stop();
+        }
+      }
+      display_contexts_.clear();
+    }
+
+    /**
+     * @brief Get all active display names being captured.
+     * @return Vector of display names currently being captured.
+     */
+    std::vector<std::string> active_displays() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      std::vector<std::string> names;
+      names.reserve(display_contexts_.size());
+      for (const auto &[name, ctx] : display_contexts_) {
+        names.push_back(name);
+      }
+      return names;
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, display_ctx_ptr> display_contexts_;
+  };
+
+  // Global multi-display capture manager
+  MultiDisplayCaptureManager multi_display_manager;
 
 #ifdef _WIN32
   encoder_t nvenc {
@@ -1369,6 +1510,274 @@ namespace video {
           return;
       }
     }
+  }
+
+  /**
+   * @brief Capture thread for a specific display in multi-display mode.
+   * @details Similar to captureThread but uses a specific display name and supports
+   *          concurrent capture from multiple displays.
+   * @param display_ctx The per-display capture context.
+   */
+  void captureThreadForDisplay(std::shared_ptr<per_display_capture_ctx_t> display_ctx) {
+    const auto &encoder = *display_ctx->encoder_p;
+    auto &capture_ctx_queue = display_ctx->capture_ctx_queue;
+    auto &display_wp = display_ctx->display_wp;
+    auto &reinit_event = display_ctx->reinit_event;
+    const std::string &target_display_name = display_ctx->display_name;
+
+    std::vector<capture_ctx_t> capture_ctxs;
+
+    auto fg = util::fail_guard([&]() {
+      capture_ctx_queue->stop();
+      display_ctx->running.store(false);
+
+      // Stop all sessions listening to this thread
+      for (auto &capture_ctx : capture_ctxs) {
+        capture_ctx.images->stop();
+      }
+      for (auto &capture_ctx : capture_ctx_queue->unsafe()) {
+        capture_ctx.images->stop();
+      }
+
+      // Decrement session count and potentially clean up
+      if (display_ctx->session_count.load() == 0) {
+        multi_display_manager.remove_display_ctx(target_display_name);
+      }
+    });
+
+    // Wait for the initial capture context or a request to stop the queue
+    auto initial_capture_ctx = capture_ctx_queue->pop();
+    if (!initial_capture_ctx) {
+      return;
+    }
+    capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
+    display_ctx->session_count.fetch_add(1);
+
+    BOOST_LOG(info) << "Starting capture thread for display: " << logging::bracket(target_display_name);
+
+    // Create display using the specified display name
+    auto disp = platf::display(encoder.platform_formats->dev_type, target_display_name, capture_ctxs.front().config);
+    if (!disp) {
+      BOOST_LOG(error) << "Failed to create display for: " << logging::bracket(target_display_name);
+      return;
+    }
+    display_wp = disp;
+
+    constexpr auto capture_buffer_size = 12;
+    std::list<std::shared_ptr<platf::img_t>> imgs(capture_buffer_size);
+
+    std::vector<std::optional<std::chrono::steady_clock::time_point>> imgs_used_timestamps;
+    const std::chrono::seconds trim_timeout = 3s;
+
+    auto trim_imgs = [&]() {
+      size_t allocated_count = 0;
+      size_t used_count = 0;
+      for (const auto &img : imgs) {
+        if (img) {
+          allocated_count += 1;
+          if (img.use_count() > 1) {
+            used_count += 1;
+          }
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (imgs_used_timestamps.size() <= used_count) {
+        imgs_used_timestamps.resize(used_count + 1);
+      }
+      imgs_used_timestamps[used_count] = now;
+
+      size_t trim_target = used_count;
+      for (size_t i = used_count; i < imgs_used_timestamps.size(); i++) {
+        if (imgs_used_timestamps[i] && now - *imgs_used_timestamps[i] < trim_timeout) {
+          trim_target = i;
+        }
+      }
+
+      if (allocated_count > trim_target) {
+        size_t to_trim = allocated_count - trim_target;
+        for (auto it = imgs.rbegin(); it != imgs.rend(); it++) {
+          auto &img = *it;
+          if (img && img.use_count() == 1) {
+            img.reset();
+            to_trim -= 1;
+            if (to_trim == 0) {
+              break;
+            }
+          }
+        }
+        imgs_used_timestamps.resize(trim_target + 1);
+      }
+    };
+
+    auto pull_free_image_callback = [&](std::shared_ptr<platf::img_t> &img_out) -> bool {
+      img_out.reset();
+      while (capture_ctx_queue->running() && display_ctx->running.load()) {
+        for (auto it = imgs.begin(); it != imgs.end(); it++) {
+          if (*it && it->use_count() == 1) {
+            img_out = *it;
+            if (it != imgs.begin()) {
+              imgs.erase(it);
+              imgs.push_front(img_out);
+            }
+            break;
+          }
+        }
+        if (!img_out) {
+          for (auto it = imgs.begin(); it != imgs.end(); it++) {
+            if (!*it) {
+              *it = disp->alloc_img();
+              img_out = *it;
+              if (it != imgs.begin()) {
+                imgs.erase(it);
+                imgs.push_front(img_out);
+              }
+              break;
+            }
+          }
+        }
+        if (img_out) {
+          trim_imgs();
+          img_out->frame_timestamp.reset();
+          return true;
+        } else {
+          std::this_thread::sleep_for(1ms);
+        }
+      }
+      return false;
+    };
+
+    // Capture takes place on this thread
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
+
+    while (capture_ctx_queue->running() && display_ctx->running.load()) {
+      auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+        // Remove stopped sessions and deliver frames to active ones
+        KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
+          if (!capture_ctx->images->running()) {
+            capture_ctx = capture_ctxs.erase(capture_ctx);
+            display_ctx->session_count.fetch_sub(1);
+            continue;
+          }
+
+          if (frame_captured) {
+            capture_ctx->images->raise(img);
+          }
+
+          ++capture_ctx;
+        })
+
+        if (!capture_ctx_queue->running() || !display_ctx->running.load()) {
+          return false;
+        }
+
+        // Accept new sessions for this display
+        while (capture_ctx_queue->peek()) {
+          auto new_ctx = capture_ctx_queue->pop();
+          if (new_ctx) {
+            capture_ctxs.emplace_back(std::move(*new_ctx));
+            display_ctx->session_count.fetch_add(1);
+          }
+        }
+
+        // If no more sessions, stop the capture
+        if (capture_ctxs.empty()) {
+          return false;
+        }
+
+        return true;
+      };
+
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+
+      switch (status) {
+        case platf::capture_e::reinit:
+          {
+            reinit_event.raise(true);
+
+            for (auto &img : imgs) {
+              img.reset();
+            }
+
+            while (display_wp->use_count() != 1) {
+              KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
+                if (!capture_ctx->images->running()) {
+                  capture_ctx = capture_ctxs.erase(capture_ctx);
+                  display_ctx->session_count.fetch_sub(1);
+                  continue;
+                }
+
+                while (capture_ctx->images->peek()) {
+                  capture_ctx->images->pop();
+                }
+
+                ++capture_ctx;
+              });
+
+              std::this_thread::sleep_for(20ms);
+            }
+
+            while (capture_ctx_queue->running() && display_ctx->running.load()) {
+              disp.reset();
+              reset_display(disp, encoder.platform_formats->dev_type, target_display_name, capture_ctxs.front().config);
+              if (disp) {
+                break;
+              }
+            }
+
+            if (!disp) {
+              return;
+            }
+
+            display_wp = disp;
+            reinit_event.reset();
+            continue;
+          }
+        case platf::capture_e::error:
+        case platf::capture_e::ok:
+        case platf::capture_e::timeout:
+        case platf::capture_e::interrupted:
+          return;
+        default:
+          BOOST_LOG(error) << "Unrecognized capture status for display " << logging::bracket(target_display_name) << ": " << (int) status;
+          return;
+      }
+    }
+
+    BOOST_LOG(info) << "Capture thread stopped for display: " << logging::bracket(target_display_name);
+  }
+
+  /**
+   * @brief Start capture for a specific display.
+   * @details Creates or reuses a capture context for the display and starts the capture thread if needed.
+   * @param display_name The display to capture. Empty string uses default display.
+   * @param images The image event queue for this session.
+   * @param config The video configuration for this session.
+   * @return True if capture was started successfully.
+   */
+  bool start_capture_for_display(const std::string &display_name, img_event_t images, const config_t &config) {
+    auto display_ctx = multi_display_manager.get_or_create_display_ctx(display_name);
+    if (!display_ctx) {
+      BOOST_LOG(error) << "Failed to get/create capture context for display: " << logging::bracket(display_name);
+      return false;
+    }
+
+    // Add the capture context to the queue
+    capture_ctx_t ctx;
+    ctx.images = images;
+    ctx.config = config;
+    ctx.display_name = display_name;
+    display_ctx->capture_ctx_queue->raise(std::move(ctx));
+
+    // Start the capture thread if not already running
+    if (!display_ctx->capture_thread.joinable()) {
+      display_ctx->capture_thread = std::thread([display_ctx]() {
+        captureThreadForDisplay(display_ctx);
+      });
+      display_ctx->capture_thread.detach();
+    }
+
+    return true;
   }
 
   int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
@@ -2392,6 +2801,157 @@ namespace video {
       // Wait for join signal
       join_event.view();
     }
+  }
+
+  /**
+   * @brief Async capture for a specific display in multi-display mode.
+   * @details Uses the multi-display capture manager to capture from a specific display.
+   */
+  void capture_async_display(
+    safe::mail_t mail,
+    config_t &config,
+    void *channel_data,
+    const std::string &display_name
+  ) {
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
+
+    auto images = std::make_shared<img_event_t::element_type>();
+    auto lg = util::fail_guard([&]() {
+      images->stop();
+      shutdown_event->raise(true);
+    });
+
+    // Get or create display capture context
+    auto display_ctx = multi_display_manager.get_or_create_display_ctx(display_name);
+    if (!display_ctx) {
+      BOOST_LOG(error) << "Failed to get/create capture context for display: " << logging::bracket(display_name);
+      return;
+    }
+
+    // Add capture context to the display's queue
+    capture_ctx_t ctx;
+    ctx.images = images;
+    ctx.config = config;
+    ctx.display_name = display_name;
+    display_ctx->capture_ctx_queue->raise(std::move(ctx));
+
+    // Start the capture thread if not already running
+    if (!display_ctx->capture_thread.joinable()) {
+      auto ctx_copy = display_ctx;  // Copy shared_ptr for thread
+      display_ctx->capture_thread = std::thread([ctx_copy]() {
+        captureThreadForDisplay(ctx_copy);
+      });
+      display_ctx->capture_thread.detach();
+    }
+
+    // Check if capture queue is still running
+    if (!display_ctx->capture_ctx_queue->running()) {
+      return;
+    }
+
+    int frame_nr = 1;
+
+    auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
+    auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
+
+    // Encoding takes place on this thread
+    platf::adjust_thread_priority(platf::thread_priority_e::high);
+
+    while (!shutdown_event->peek() && images->running()) {
+      // Wait for the main capture event when the display is being reinitialized
+      if (display_ctx->reinit_event.peek()) {
+        std::this_thread::sleep_for(20ms);
+        continue;
+      }
+
+      // Wait for the display to be ready
+      std::shared_ptr<platf::display_t> display;
+      {
+        auto lg = display_ctx->display_wp.lock();
+        if (display_ctx->display_wp->expired()) {
+          continue;
+        }
+
+        display = display_ctx->display_wp->lock();
+      }
+
+      auto &encoder = *chosen_encoder;
+
+      auto encode_device = make_encode_device(*display, encoder, config);
+      if (!encode_device) {
+        return;
+      }
+
+      // absolute mouse coordinates require that the dimensions of the screen are known
+      touch_port_event->raise(make_port(display.get(), config));
+
+      // Update client with our current HDR display state
+      hdr_info_t hdr_info = std::make_unique<hdr_info_raw_t>(false);
+      if (colorspace_is_hdr(encode_device->colorspace)) {
+        if (display->get_hdr_metadata(hdr_info->metadata)) {
+          hdr_info->enabled = true;
+        } else {
+          BOOST_LOG(error) << "Couldn't get display hdr metadata when colorspace selection indicates it should have one";
+        }
+      }
+      hdr_event->raise(std::move(hdr_info));
+
+      encode_run(
+        frame_nr,
+        mail,
+        images,
+        config,
+        display,
+        std::move(encode_device),
+        display_ctx->reinit_event,
+        *display_ctx->encoder_p,
+        channel_data
+      );
+    }
+  }
+
+  void capture_display(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    const std::string &display_name
+  ) {
+    auto idr_events = mail->event<bool>(mail::idr);
+
+    idr_events->raise(true);
+
+    // For multi-display, we always use async capture to allow concurrent display streaming
+    if (chosen_encoder->flags & PARALLEL_ENCODING) {
+      capture_async_display(std::move(mail), config, channel_data, display_name);
+    } else {
+      // For sync encoding, we need to use the sync path with display binding
+      safe::signal_t join_event;
+      auto ref = capture_thread_sync.ref();
+      sync_session_ctx_t session_ctx {
+        &join_event,
+        mail->event<bool>(mail::shutdown),
+        mail::man->queue<packet_t>(mail::video_packets),
+        std::move(idr_events),
+        mail->event<hdr_info_t>(mail::hdr),
+        mail->event<input::touch_port_t>(mail::touch_port),
+        config,
+        1,
+        channel_data,
+        display_name,  // Add display_name to sync session context
+      };
+      ref->encode_session_ctx_queue.raise(std::move(session_ctx));
+
+      // Wait for join signal
+      join_event.view();
+    }
+  }
+
+  std::vector<std::string> active_capture_displays() {
+    return multi_display_manager.active_displays();
+  }
+
+  void shutdown_multi_display_capture() {
+    multi_display_manager.shutdown_all();
   }
 
   enum validate_flag_e {

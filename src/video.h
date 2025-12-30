@@ -342,6 +342,34 @@ namespace video {
     void *channel_data
   );
 
+  /**
+   * @brief Start video capture for a specific display.
+   * @details Multi-display version of capture() that allows specifying which display to capture.
+   *          This enables concurrent streaming from multiple displays to different clients.
+   * @param mail The mail context for this session.
+   * @param config The video configuration for this session.
+   * @param channel_data The channel data for this session.
+   * @param display_name The display to capture. Empty string uses default display.
+   */
+  void capture_display(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    const std::string &display_name
+  );
+
+  /**
+   * @brief Get the list of currently active display captures.
+   * @return Vector of display names currently being captured.
+   */
+  std::vector<std::string> active_capture_displays();
+
+  /**
+   * @brief Shutdown all multi-display captures.
+   * @details Called during application shutdown to clean up all capture contexts.
+   */
+  void shutdown_multi_display_capture();
+
   bool validate_encoder(encoder_t &encoder, bool expect_failure);
 
   /**
