@@ -36,6 +36,14 @@ namespace stream {
     uint32_t encryptionFlagsEnabled;
 
     std::optional<int> gcmap;
+
+    /**
+     * @brief The display name to capture for this session.
+     * @details Empty string means use the default display from config.
+     *          Used for multi-display streaming where different clients
+     *          can stream from different displays.
+     */
+    std::string display_name;
   };
 
   namespace session {

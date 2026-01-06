@@ -1044,6 +1044,12 @@ namespace rtsp_stream {
       config.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;
     }
 
+    // Set the display name for multi-display streaming
+    config.display_name = session.display_name;
+    if (!config.display_name.empty()) {
+      BOOST_LOG(info) << "Client requested display: " << logging::bracket(config.display_name);
+    }
+
     // If the client sent a configured bitrate, we will choose the actual bitrate ourselves
     // by using FEC percentage and audio quality settings. If the calculated bitrate ends up
     // too low, we'll allow it to exceed the limits rather than reducing the encoding bitrate

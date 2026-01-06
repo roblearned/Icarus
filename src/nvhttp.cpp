@@ -313,6 +313,10 @@ namespace nvhttp {
     launch_session->gcmap = util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
 
+    // Display selection for multi-display support
+    // Client can specify display by name (e.g., "DP-1") or index (e.g., "0", "1")
+    launch_session->display_name = get_arg(args, "display", "");
+
     // Encrypted RTSP is enabled with client reported corever >= 1
     auto corever = util::from_view(get_arg(args, "corever", "0"));
     if (corever >= 1) {
@@ -810,6 +814,68 @@ namespace nvhttp {
     }
   }
 
+  /**
+   * @brief HTTP endpoint to list available displays for multi-display streaming.
+   * @details Returns an XML list of available displays with their names and indices.
+   *          Clients can use the display name or index in the launch request to select
+   *          which display to stream.
+   */
+  void displays(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+
+    pt::ptree tree;
+
+    auto g = util::fail_guard([&]() {
+      std::ostringstream data;
+
+      pt::write_xml(data, tree);
+      response->write(data.str());
+      response->close_connection_after_response = true;
+    });
+
+    auto &displays_node = tree.add_child("root", pt::ptree {});
+    displays_node.put("<xmlattr>.status_code", 200);
+
+    // Get the list of display devices
+    auto devices = display_device::enumerate_devices();
+    int index = 0;
+    for (const auto &device : devices) {
+      pt::ptree display;
+
+      display.put("Index", index);
+      display.put("DeviceId", device.m_device_id);
+      display.put("FriendlyName", device.m_info ? device.m_info->m_friendly_name : "Unknown");
+      display.put("Primary", device.m_info && device.m_info->m_primary ? 1 : 0);
+      display.put("Active", device.m_info ? 1 : 0);
+
+      // Include resolution info if available
+      if (device.m_info && device.m_info->m_resolution) {
+        display.put("Width", device.m_info->m_resolution->m_width);
+        display.put("Height", device.m_info->m_resolution->m_height);
+      }
+
+      // Include HDR state if available
+      if (device.m_info && device.m_info->m_hdr_state) {
+        display.put("HdrEnabled", *device.m_info->m_hdr_state == HdrState::Enabled ? 1 : 0);
+      }
+
+      displays_node.push_back(std::make_pair("Display", std::move(display)));
+      index++;
+    }
+
+    // Also include platform-native display names for compatibility
+    // These are what the capture backends actually use
+    auto display_names = platf::display_names(platf::mem_type_e::unknown);
+    pt::ptree native_names;
+    for (size_t i = 0; i < display_names.size(); i++) {
+      pt::ptree name_entry;
+      name_entry.put("Index", i);
+      name_entry.put("Name", display_names[i]);
+      native_names.push_back(std::make_pair("NativeDisplay", std::move(name_entry)));
+    }
+    displays_node.add_child("NativeDisplays", native_names);
+  }
+
   void launch(bool &host_audio, resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
@@ -1148,6 +1214,7 @@ namespace nvhttp {
       pair<SunshineHTTPS>(add_cert, resp, req);
     };
     https_server.resource["^/applist$"]["GET"] = applist;
+    https_server.resource["^/displays$"]["GET"] = displays;
     https_server.resource["^/appasset$"]["GET"] = appasset;
     https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
       launch(host_audio, resp, req);

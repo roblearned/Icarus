@@ -36,6 +36,13 @@ namespace rtsp_stream {
     bool enable_hdr;
     bool enable_sops;
 
+    /**
+     * @brief The display/monitor to capture for this session.
+     * @details Empty string means use the default display from config.
+     *          Can be a display name (e.g., "DP-1", "HDMI-0") or index (e.g., "0", "1").
+     */
+    std::string display_name;
+
     std::optional<crypto::cipher::gcm_t> rtsp_cipher;
     std::string rtsp_url_scheme;
     uint32_t rtsp_iv_counter;
